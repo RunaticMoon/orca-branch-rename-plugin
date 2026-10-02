@@ -1,0 +1,16 @@
+{
+  "name": "RunaticMoon Orca Plugins",
+  "owner": "RunaticMoon",
+  "plugins": [
+    {
+      "id": "runaticmoon.korean-branch-en",
+      "source": {
+        "kind": "git",
+        "url": "https://github.com/RunaticMoon/orca-branch-rename-plugin.git",
+        "ref": "v0.1.0"
+      },
+      "description": "워크트리를 만들면 브랜치 이름 끝의 한글을 영어 kebab-case 로 바꿉니다(git branch -m, 폴더는 그대로).",
+      "categories": ["git", "worktrees", "korean"]
+    }
+  ]
+}
