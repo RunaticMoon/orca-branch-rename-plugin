@@ -1,0 +1,35 @@
+{
+  "manifestVersion": 1,
+  "id": "korean-branch-en",
+  "publisher": "runaticmoon",
+  "name": "한글 브랜치 영어 변환",
+  "version": "0.1.0",
+  "description": "워크트리를 만들면 브랜치 이름 끝의 한글을 영어 kebab-case 로 바꿉니다(git branch -m, 폴더는 그대로).",
+  "author": {
+    "name": "RunaticMoon"
+  },
+  "repository": "https://github.com/RunaticMoon/orca-branch-rename-plugin",
+  "engines": {
+    "orca": ">=1.4.217"
+  },
+  "pluginApi": 1,
+  "main": "main.mjs",
+  "contributes": {
+    "events": [
+      { "on": "worktree.created" }
+    ],
+    "commands": [
+      {
+        "id": "rename-branch-en",
+        "title": "브랜치 이름을 영어로 다시 바꾸기",
+        "context": "worktree"
+      }
+    ]
+  },
+  "capabilities": [
+    { "kind": "events:subscribe" },
+    { "kind": "notifications:show" },
+    { "kind": "workspace:read" },
+    { "kind": "storage" }
+  ]
+}

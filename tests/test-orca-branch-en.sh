@@ -2,17 +2,18 @@
 #
 # test-orca-branch-en.sh
 #
-# orca-branch-en.sh / install.sh 를 네트워크 없이 검증한다.
+# bin/orca-branch-en.sh 를 네트워크 없이 검증한다.
 # 실제 claude 호출은 하지 않고 ORCA_BRANCH_EN_SLUG_CMD 로 slug 명령을 바꿔치기한다.
-# 실제 ~/.local/bin 에 설치하지 않고 ORCA_BRANCH_EN_INSTALL_DIR 로 임시 경로를 쓴다.
 #
 # macOS 의 bash 3.2 에서도 돌 수 있도록 4.0+ 문법을 쓰지 않는다.
+#
+# OUT 은 실패를 조사할 때 바로 echo 해 보려고 모든 실행에서 담아 둔다(현재 검사에는 쓰지 않음).
+# shellcheck disable=SC2034
 
 SCRIPT_DIR=$(cd "$(dirname "$0")" && pwd)
-# 스크립트는 테스트 디렉터리가 아니라 형제 디렉터리(../scripts)에 있다.
-SCRIPTS_DIR=$(cd "$SCRIPT_DIR/../scripts" && pwd)
-TARGET="$SCRIPTS_DIR/orca-branch-en.sh"
-INSTALL="$SCRIPTS_DIR/install.sh"
+# 스크립트는 테스트 디렉터리가 아니라 형제 디렉터리(../bin)에 있다.
+BIN_DIR=$(cd "$SCRIPT_DIR/../bin" && pwd)
+TARGET="$BIN_DIR/orca-branch-en.sh"
 
 TMP=$(mktemp -d 2>/dev/null)
 if [ -z "$TMP" ] || [ ! -d "$TMP" ]; then
@@ -280,38 +281,17 @@ done
 if [ "$skip12" -eq 1 ]; then
   skip "case12 claude 미발견(실제 claude 가 제한 경로에 있어 건너뜀)"
 else
-  OUT=$(cd / && env -u ORCA_BRANCH_EN_SLUG_CMD -u ORCA_WORKTREE_PATH \
+  (cd / && env -u ORCA_BRANCH_EN_SLUG_CMD -u ORCA_WORKTREE_PATH \
         -u ORCA_BRANCH_EN_DRY_RUN \
         PATH=/usr/bin:/bin HOME="$fakehome" ORCA_BRANCH_EN_CLAUDE=/nonexistent \
-        ORCA_BRANCH_EN_LOG="$log" bash "$TARGET" "$wt" 2>&1)
+        ORCA_BRANCH_EN_LOG="$log" bash "$TARGET" "$wt" >/dev/null 2>&1)
   RC=$?
-  if [ "$RC" -eq 0 ] && [ "$(branch_of "$wt")" = "feature/한글-클로드없음" ]; then
-    pass "case12 claude 미발견 시 조용히 종료(코드 0, 브랜치 유지)"
+  if [ "$RC" -eq 0 ] && [ "$(branch_of "$wt")" = "feature/한글-클로드없음" ] \
+     && grep -qF "fail: claude 실행 파일을 찾을 수 없음" "$log"; then
+    pass "case12 claude 미발견 시 fail 기록(코드 0, 브랜치 유지)"
   else
     fail "case12 claude 미발견 (rc=$RC branch=$(branch_of "$wt"))"
   fi
-fi
-
-# ---------------------------------------------------------------------------
-# case 13: install.sh 설치/삭제
-# ---------------------------------------------------------------------------
-echo "== install.sh =="
-indir="$TMP/install"
-OUT=$(ORCA_BRANCH_EN_INSTALL_DIR="$indir" bash "$INSTALL" 2>&1)
-RC=$?
-if [ "$RC" -eq 0 ] && [ -x "$indir/orca-branch-en.sh" ] \
-   && printf '%s' "$OUT" | grep -q '|| true'; then
-  pass "case13a install.sh 설치(복사+실행권한, || true 안내)"
-else
-  fail "case13a install.sh 설치 (rc=$RC exists=$([ -x "$indir/orca-branch-en.sh" ] && echo yes || echo no))"
-fi
-
-OUT=$(ORCA_BRANCH_EN_INSTALL_DIR="$indir" bash "$INSTALL" --uninstall 2>&1)
-RC=$?
-if [ "$RC" -eq 0 ] && [ ! -e "$indir/orca-branch-en.sh" ] && [ ! -e "$indir/orca-setup-audit.sh" ]; then
-  pass "case13b install.sh --uninstall 삭제"
-else
-  fail "case13b install.sh --uninstall (rc=$RC)"
 fi
 
 # ---------------------------------------------------------------------------
@@ -427,12 +407,6 @@ else
   fail "bash -n orca-branch-en.sh"
 fi
 
-if bash -n "$INSTALL" 2>/dev/null; then
-  pass "bash -n install.sh"
-else
-  fail "bash -n install.sh"
-fi
-
 if bash -n "$0" 2>/dev/null; then
   pass "bash -n test-orca-branch-en.sh"
 else
@@ -440,7 +414,7 @@ else
 fi
 
 if command -v shellcheck >/dev/null 2>&1; then
-  if shellcheck -s bash "$TARGET" "$INSTALL" "$0" 2>/dev/null; then
+  if shellcheck -s bash "$TARGET" "$0" 2>/dev/null; then
     pass "shellcheck"
   else
     fail "shellcheck"

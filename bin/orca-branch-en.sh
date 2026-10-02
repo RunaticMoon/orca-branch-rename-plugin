@@ -6,11 +6,16 @@
 #       폴더 이름은 그대로 두고 `git branch -m` 만 한다. Orca 는 브랜치 이름을 git 에서 읽으므로
 #       폴더를 옮기지 않아도 화면에 반영된다.
 #
+# 누가 부르는가:
+#   주로 Orca 플러그인 워커(main.mjs)가 `worktree.created` 를 받으면 `bash orca-branch-en.sh <경로>` 로 부른다.
+#   워커는 stdout 의 마지막 `[orca-branch-en] ` 줄(renamed/skip/fail)로 결과를 해석한다.
+#   터미널이나 저장소 셋업 스크립트에서 단독으로 실행해도 된다.
+#
 # 왜 전체에 set -e 를 쓰지 않는가:
-#   Orca 셋업 러너는 저장소별 셋업 스크립트를 `#!/usr/bin/env bash` + `set -e` 로 감싸 실행한다.
-#   이 스크립트가 0 이 아닌 코드로 끝나면 그 지점에서 셋업 전체가 멈춘다.
-#   그래서 어떤 실패(경로 없음, git 아님, slug 실패, branch -m 실패 등)에도 반드시 0 으로 끝나도록
-#   main()/task() 안에서 모두 `return 0` 으로 빠져나오고 마지막에 `exit 0` 을 둔다.
+#   셋업 스크립트에서 부를 때 Orca 셋업 러너는 `set -e` 로 감싸 실행하므로, 0 이 아닌 코드로 끝나면
+#   셋업 전체가 멈춘다. 그래서 어떤 실패(경로 없음, git 아님, slug 실패, branch -m 실패 등)에도
+#   반드시 0 으로 끝나도록 main()/task() 안에서 모두 `return 0` 으로 빠져나오고 마지막에 `exit 0` 을 둔다.
+#   실패 여부는 종료 코드가 아니라 결과 줄로 알린다.
 #
 # 왜 bash 3.2 를 신경 쓰는가:
 #   대상 OS 인 macOS 의 기본 /bin/bash 는 3.2 다. 연관 배열·${var,,}·mapfile 은 4.0+ 이므로 쓰지 않고,
@@ -226,11 +231,14 @@ task() {
   # slug 생성: 테스트용 바꿔치기(ORCA_BRANCH_EN_SLUG_CMD)가 있으면 그것을 claude 대신 쓴다.
   # 출력은 명령치환 대신 임시 파일로 받는다(이유는 run_with_timeout 주석 참고).
   # 남은 파일은 정상 경로에서 지우고, 중간 실패로 빠져도 trap 이 마무리한다.
+  # trap 을 먼저 걸어 두 번째 mktemp 만 실패해도 첫 파일이 남지 않게 한다.
+  tmp_out=""
+  tmp_err=""
+  trap 'rm -f ${tmp_out:+"$tmp_out"} ${tmp_err:+"$tmp_err"}' EXIT
   if ! tmp_out=$(mktemp 2>/dev/null) || ! tmp_err=$(mktemp 2>/dev/null); then
     log_result "fail: 임시 파일을 만들 수 없음"
     return 0
   fi
-  trap 'rm -f "$tmp_out" "$tmp_err"' EXIT
 
   status=0
   if [ -n "$slug_cmd" ]; then
@@ -240,7 +248,8 @@ task() {
   else
     claude_path=$(find_claude "$claude_env")
     if [ -z "$claude_path" ]; then
-      log_result "skip: claude 실행 파일을 찾을 수 없음"
+      # 사용자가 고쳐야 하는 문제라 skip 이 아니라 fail 로 알린다(플러그인이 실패 알림을 띄운다).
+      log_result "fail: claude 실행 파일을 찾을 수 없음"
       return 0
     fi
     # 프롬프트는 영어로 고정하고, 번역할 텍스트를 프롬프트 뒤에 붙인다.
