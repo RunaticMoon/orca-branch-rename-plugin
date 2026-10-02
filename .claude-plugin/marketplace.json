@@ -1,0 +1,17 @@
+{
+  "name": "orca-local",
+  "owner": {
+    "name": "RunaticMoon"
+  },
+  "metadata": {
+    "description": "Orca 워크트리 셋업 훅·한글 브랜치 리네임을 위한 개인 로컬 마켓플레이스"
+  },
+  "plugins": [
+    {
+      "name": "orca-setup-hooks",
+      "source": "./plugins/orca-setup-hooks",
+      "description": "Orca 저장소별 셋업 스크립트 지식, 한글 워크트리 브랜치 영어 리네임(orca-branch-en.sh), 셋업 감사(orca-setup-audit)",
+      "version": "0.1.0"
+    }
+  ]
+}
