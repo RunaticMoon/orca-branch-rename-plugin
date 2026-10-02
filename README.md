@@ -23,9 +23,11 @@ Orca에서 워크스페이스 이름을 한글로 지어 워크트리를 만들�
 ## 설치
 
 1. Orca → Settings → Plugins → **Plugin system**(Experimental)을 켭니다.
-2. **Install plugin**에서 설치 방법을 고릅니다.
-   - **Git URL**: `https://github.com/RunaticMoon/orca-branch-rename-plugin#v0.1.0`
-   - **Local folder**: 이 저장소를 클론한 폴더의 절대경로
+2. 설치 방법을 고릅니다.
+   - **Marketplace**: **Marketplace sources** → **Add marketplace**에 URL `https://github.com/RunaticMoon/orca-branch-rename-plugin.git`, ref `main`을 넣습니다. 목록(**All** 탭)에서 "한글 브랜치 영어 변환"의 **Install**을 누릅니다.
+     - Orca는 marketplace를 추가할 때 그 ref의 커밋을 고정합니다. 새 버전은 새로고침(**Refresh**)으로 받습니다.
+   - **Install plugin → Git URL**: `https://github.com/RunaticMoon/orca-branch-rename-plugin#v0.1.0`
+   - **Install plugin → Local folder**: 이 저장소를 클론한 폴더의 절대경로
 3. 권한 검토 창을 확인하고 **Enable plugin**을 누릅니다.
    - 요청 권한: 워크트리 이벤트 구독, 알림 표시, 현재 워크트리 정보 읽기, 플러그인 저장소(수동 명령이 쓸 워크트리 경로 기억)
    - 이 플러그인은 백그라운드 워커가 있습니다. Orca 안내대로 워커는 일반 프로세스로 실행되며, 여기서 `git`과 `claude`를 실행합니다.
@@ -48,6 +50,7 @@ Orca에서 워크스페이스 이름을 한글로 지어 워크트리를 만들�
 | 경로 | 내용 |
 |---|---|
 | `orca-plugin.json` | 플러그인 매니페스트 |
+| `orca-marketplace.json` | Orca marketplace 목록. 이 저장소를 marketplace 소스로 추가할 때 읽힘 |
 | `main.mjs` | 워커. `worktree.created`를 받아 스크립트를 실행하고 결과를 알림으로 보냄. 수동 명령용으로 경로를 storage에 기억 |
 | `bin/orca-branch-en.sh` | 리네임 본체(bash 3.2 호환, 항상 exit 0). 단독 실행 가능: `bash bin/orca-branch-en.sh <워크트리 경로>` |
 | `tests/` | 네트워크 없이 도는 테스트 |
@@ -58,7 +61,15 @@ Orca에서 워크스페이스 이름을 한글로 지어 워크트리를 만들�
 ```bash
 bash tests/test-orca-branch-en.sh       # 리네임 스크립트
 node tests/test-plugin-host.mjs         # 실제 Orca 플러그인 호스트로 워커 검증 (ORCA_RESOURCES 로 Orca 위치 지정)
+node tests/test-marketplace.mjs         # orca-marketplace.json 형식·버전 일치
 ```
+
+### 새 버전 출시
+
+1. `orca-plugin.json`의 `version`을 올린다.
+2. `orca-marketplace.json`의 해당 항목 `source.ref`를 `v<버전>`으로 바꾼다.
+3. 커밋해 `main`에 머지한다.
+4. `v<버전>` 태그를 push한다.
 
 ## 알려진 제약
 

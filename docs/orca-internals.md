@@ -53,15 +53,30 @@ grep -rl 'autoRenameBranchFromWork' "$tmp" | head
 ### 설치와 켜기
 
 1. Settings → Plugins → **Plugin system**(Experimental)을 켠다. 설정 키는 `pluginSystemEnabled`이고 기본값은 꺼짐이다.
-2. 설치 방법은 셋 중 하나다.
+2. 설치 방법은 다음 중 하나다.
    - **Install plugin → Local folder**: `orca-plugin.json`이 있는 폴더의 절대경로를 넣는다.
    - **Install plugin → Git URL**: HTTPS·SSH URL 뒤에 `#태그` 또는 `#커밋`을 반드시 붙인다. 태그는 원격에 push되어 있어야 한다.
+   - **Marketplace**: **Marketplace sources** → **Add marketplace**에 Git URL과 ref를 넣는다. 목록에서 고른 뒤 **Install**을 누른다. 규칙은 아래 **Marketplace**를 본다.
    - **Development**: 플러그인 폴더를 `devPluginPaths`에 추가한다. 복사하지 않고 그 자리에서 불러온다.
 3. 권한 검토 창에서 **Enable plugin**을 누른다. 그 전에는 코드가 실행되지 않는다. 권한이나 워커 여부가 바뀌면 다시 검토해야 한다.
 
 - 설치 위치: `<userData>/plugins/<publisher>.<id>/<contentHash>/`
   - `<userData>`는 macOS에서 `~/Library/Application Support/orca`, Linux에서 `~/.config/orca`다.
 - 실행 로그는 Settings의 플러그인 행 → **View logs**에서 본다(최근 200줄).
+
+### Marketplace
+
+- Settings → Plugins → **Marketplace sources** → **Add marketplace**에 Git URL(HTTPS/SSH)과 ref를 넣으면 커스텀 marketplace를 추가한다. Orca는 그 ref를 depth 1로 가져와 **저장소 루트**의 `orca-marketplace.json`을 읽는다. 파일 이름은 `PLUGIN_MARKETPLACE_FILENAME`으로 고정되어 있고 다른 경로는 보지 않는다.
+- 스키마는 모두 `strictObject`라 정의에 없는 키는 거부한다(`out/shared/plugins/plugin-marketplace.js`).
+  - 최상위: `{name: 1~256자, owner: /^[A-Za-z0-9](?:[A-Za-z0-9._-]*[A-Za-z0-9])?$/ 1~128자, plugins: 배열 ≤2048, id 중복 금지}`
+  - 항목: `{id: "<publisher>.<id>", source: {kind:"git", url, ref}, description?: 1~4096자, categories?: 소문자 slug 배열}`
+    - `source`도 `strictObject`라 `kind`/`url`/`ref`만 쓴다. `kind`는 `"git"`이고 `url`은 HTTPS 또는 SSH만, `ref`는 1~4096자 필수다.
+    - `categories` 각 항목은 `/^[a-z0-9]+(?:-[a-z0-9]+)*$/`, 1~64자, ≤16개, 중복 금지다.
+  - 지원 안 하는 카테고리(`themes`, `icons`, `icon-themes`, `terminal-themes`, `skills`)가 있으면 목록에서 숨긴다(`isMarketplaceListingSupported`).
+- 설치: 항목의 `source.url`+`ref`를 가져와 루트의 `orca-plugin.json`을 읽고, `entry.id === manifest.publisher + "." + manifest.id`를 강제한다. marketplace 저장소와 플러그인 저장소가 같아도 막지 않는다.
+- 예약 신원: publisher가 `stablyai`이거나 id가 `orca-`로 시작하면(`isReservedPluginIdentity`) 공식 저장소만 허용한다.
+- marketplace를 추가할 때 ref는 커밋으로 고정되므로 새 버전은 새로고침(**Refresh**)으로 받는다.
+- 근거: `out/shared/plugins/plugin-marketplace.js`, IPC `plugins:addMarketplace` / `plugins:listMarketplacePlugins` / `plugins:previewMarketplacePlugin` / `plugins:installMarketplacePlugin`.
 
 ### 이 플러그인의 선택
 
