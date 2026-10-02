@@ -1,9 +1,0 @@
-{
-  "name": "orca-setup-hooks",
-  "version": "0.1.0",
-  "description": "Orca 저장소별 셋업 스크립트 지식, 한글 워크트리 브랜치 영어 리네임(orca-branch-en.sh), 셋업 감사(orca-setup-audit)",
-  "author": {
-    "name": "RunaticMoon"
-  },
-  "keywords": ["orca", "worktree", "setup-hook", "branch", "korean"]
-}
