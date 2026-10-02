@@ -17,8 +17,11 @@ import {
   readFileSync,
   readdirSync,
   existsSync,
+  mkdirSync,
   mkdtempSync,
   rmSync,
+  writeFileSync,
+  chmodSync,
 } from 'node:fs';
 import { tmpdir } from 'node:os';
 
@@ -938,6 +941,312 @@ async function caseH4() {
   }
 }
 
+// ---------------------------------------------------------------------------
+// 케이스 i1: git 판독 불가(가짜 git 실패) → 실행하지 않고 pending 보존
+// ---------------------------------------------------------------------------
+async function caseI1() {
+  const name = 'i1 판독 불가 시 pending 보존';
+  if (!existsSync(HOST_ENTRY)) {
+    skip(name, 'host entry 없음');
+    return;
+  }
+  let w;
+  try {
+    // 워커 PATH 맨 앞에 git 대신 exit 2 하는 스크립트를 둬서 currentBranch 가 'unknown' 을 내게 한다.
+    const fakeDir = join(TMP, 'fake-git-i1');
+    mkdirSync(fakeDir, { recursive: true });
+    const fakeGit = join(fakeDir, 'git');
+    writeFileSync(fakeGit, '#!/bin/sh\nexit 2\n');
+    chmodSync(fakeGit, 0o755);
+
+    const branch = 'feature/판독-불가';
+    const { addWorktree } = makeRepo('repo-i1');
+    const wt = addWorktree(branch, 'wt');
+    // 경로는 실제로 존재하지만 git 이 실패해 브랜치를 확인할 수 없는 상태를 시드한다.
+    seedPending({ [wt]: branch });
+
+    w = startWorker({
+      PATH: `${fakeDir}:${process.env.PATH}`,
+      ORCA_BRANCH_EN_LOG: join(TMP, 'i1.log'),
+    });
+    w.init();
+    await w.next((m) => m.type === 'ready', 'ready');
+
+    w.send({ type: 'invokeCommand', callId: 301, commandId: 'rename-branch-en' });
+    const rc = await w.next(
+      (m) => m.type === 'hostCall' && m.method === 'workspace.readContext',
+      'workspace.readContext(i1)',
+    );
+    w.hostResult(rc.callId, { branch, displayName: 'x', terminals: [] });
+
+    const notif = await w.next(
+      (m) => m.type === 'hostCall' && m.method === 'notifications.show',
+      'notifications.show(i1)',
+    );
+    w.hostResult(notif.callId, { delivered: true });
+    const cmd = await w.next(
+      (m) => m.type === 'commandResult' && m.callId === 301,
+      'commandResult 301',
+    );
+
+    check(
+      `${name}: value.ok=false`,
+      cmd.ok === true && cmd.value && cmd.value.ok === false,
+      JSON.stringify(cmd),
+    );
+    check(
+      `${name}: 확인 불가 안내`,
+      notif.params && typeof notif.params.body === 'string' && notif.params.body.includes('확인할 수 없습니다'),
+      JSON.stringify(notif.params),
+    );
+    // 판독 불가일 뿐 브랜치가 바뀐 게 아니므로 기억은 남아 있어야 한다.
+    check(
+      `${name}: pending 유지`,
+      pendingHasPath(wt) && pendingBranchOf(wt) === branch,
+      JSON.stringify(pendingValue()),
+    );
+    check(`${name}: 브랜치 그대로`, branchOf(wt) === branch, `branch=${branchOf(wt)}`);
+    check(
+      `${name}: terminal.sendText 없음`,
+      w.leftoverHostCalls().every((m) => m.method !== 'terminal.sendText'),
+      w.dump(),
+    );
+  } catch (err) {
+    fail(name, err.message);
+  } finally {
+    try {
+      w.child.kill();
+    } catch {
+      /* ignore */
+    }
+  }
+}
+
+// ---------------------------------------------------------------------------
+// 케이스 i2: 사라진 경로는 정리하고 실제 경로만 실행
+// ---------------------------------------------------------------------------
+async function caseI2() {
+  const name = 'i2 사라진 경로 정리 후 실행';
+  if (!existsSync(HOST_ENTRY)) {
+    skip(name, 'host entry 없음');
+    return;
+  }
+  let w;
+  try {
+    const branch = 'feature/사라진-경로';
+    const { addWorktree } = makeRepo('repo-i2');
+    const wt = addWorktree(branch, 'wt');
+    const ghost = join(TMP, 'repo-i2-ghost-wt'); // 존재하지 않는 경로
+    seedPending({ [ghost]: branch, [wt]: branch });
+
+    w = startWorker({
+      ORCA_BRANCH_EN_SLUG_CMD: 'echo "sample task"',
+      ORCA_BRANCH_EN_LOG: join(TMP, 'i2.log'),
+    });
+    w.init();
+    await w.next((m) => m.type === 'ready', 'ready');
+
+    w.send({ type: 'invokeCommand', callId: 302, commandId: 'rename-branch-en' });
+    const rc = await w.next(
+      (m) => m.type === 'hostCall' && m.method === 'workspace.readContext',
+      'workspace.readContext(i2)',
+    );
+    w.hostResult(rc.callId, { branch, displayName: 'x', terminals: [] });
+    const cmd = await w.next(
+      (m) => m.type === 'commandResult' && m.callId === 302,
+      'commandResult 302',
+    );
+    check(
+      `${name}: 실제 경로만 started`,
+      cmd.ok === true && cmd.value && cmd.value.ok === true && cmd.value.started === true,
+      JSON.stringify(cmd),
+    );
+
+    const notif = await w.next(
+      (m) => m.type === 'hostCall' && m.method === 'notifications.show',
+      'notifications.show(i2)',
+    );
+    w.hostResult(notif.callId, { delivered: true });
+    // 성공 후 저장까지 끝나야 다음 케이스 시드와 겹치지 않는다. 실제 경로 제거까지 기다린다.
+    await waitFor(
+      () => branchOf(wt) === 'feature/sample-task' && !pendingHasPath(ghost) && !pendingHasPath(wt),
+    );
+
+    check(`${name}: 브랜치 영어로 변경`, branchOf(wt) === 'feature/sample-task', `branch=${branchOf(wt)}`);
+    check(`${name}: 없는 경로 제거`, !pendingHasPath(ghost), JSON.stringify(pendingValue()));
+    check(`${name}: 실제 경로도 성공 후 제거`, !pendingHasPath(wt), JSON.stringify(pendingValue()));
+    check(
+      `${name}: terminal.sendText 없음`,
+      w.leftoverHostCalls().every((m) => m.method !== 'terminal.sendText'),
+      w.dump(),
+    );
+  } catch (err) {
+    fail(name, err.message);
+  } finally {
+    try {
+      w.child.kill();
+    } catch {
+      /* ignore */
+    }
+  }
+}
+
+// ---------------------------------------------------------------------------
+// 케이스 i3: 같은 브랜치 후보 11개 → git 확인 없이 거절, pending 그대로
+// ---------------------------------------------------------------------------
+async function caseI3() {
+  const name = 'i3 후보 11개 초과 거절';
+  if (!existsSync(HOST_ENTRY)) {
+    skip(name, 'host entry 없음');
+    return;
+  }
+  let w;
+  try {
+    // git 이 호출되면 marker 를 남기는 가짜 git 을 앞에 둔다(호출 여부 확인용).
+    const fakeDir = join(TMP, 'fake-git-i3');
+    mkdirSync(fakeDir, { recursive: true });
+    const marker = join(TMP, 'i3.git-called');
+    const fakeGit = join(fakeDir, 'git');
+    writeFileSync(fakeGit, `#!/bin/sh\ntouch '${marker}'\nexit 2\n`);
+    chmodSync(fakeGit, 0o755);
+
+    const branch = 'feature/후보-과다';
+    const seeded = {};
+    for (let i = 0; i < 11; i += 1) seeded[join(TMP, `repo-i3-ghost-${i}`)] = branch;
+    seedPending(seeded);
+
+    w = startWorker({
+      PATH: `${fakeDir}:${process.env.PATH}`,
+      ORCA_BRANCH_EN_LOG: join(TMP, 'i3.log'),
+    });
+    w.init();
+    await w.next((m) => m.type === 'ready', 'ready');
+
+    w.send({ type: 'invokeCommand', callId: 303, commandId: 'rename-branch-en' });
+    const rc = await w.next(
+      (m) => m.type === 'hostCall' && m.method === 'workspace.readContext',
+      'workspace.readContext(i3)',
+    );
+    w.hostResult(rc.callId, { branch, displayName: 'x', terminals: [] });
+    const notif = await w.next(
+      (m) => m.type === 'hostCall' && m.method === 'notifications.show',
+      'notifications.show(i3)',
+    );
+    w.hostResult(notif.callId, { delivered: true });
+    const cmd = await w.next(
+      (m) => m.type === 'commandResult' && m.callId === 303,
+      'commandResult 303',
+    );
+
+    check(
+      `${name}: value.ok=false`,
+      cmd.ok === true && cmd.value && cmd.value.ok === false,
+      JSON.stringify(cmd),
+    );
+    check(
+      `${name}: 너무 많아 안내`,
+      notif.params && typeof notif.params.body === 'string' && notif.params.body.includes('너무 많아'),
+      JSON.stringify(notif.params),
+    );
+    check(`${name}: git 미호출`, !existsSync(marker));
+    check(
+      `${name}: pending 11개 그대로`,
+      pendingPathsFor(branch).length === 11,
+      JSON.stringify(pendingValue()),
+    );
+    check(
+      `${name}: terminal.sendText 없음`,
+      w.leftoverHostCalls().every((m) => m.method !== 'terminal.sendText'),
+      w.dump(),
+    );
+  } catch (err) {
+    fail(name, err.message);
+  } finally {
+    try {
+      w.child.kill();
+    } catch {
+      /* ignore */
+    }
+  }
+}
+
+// ---------------------------------------------------------------------------
+// 케이스 i4: 매칭 7개 → 본문은 경로 5줄 + '외 2개', 1000자 이하
+// ---------------------------------------------------------------------------
+async function caseI4() {
+  const name = 'i4 고를 수 없음 본문 절단';
+  if (!existsSync(HOST_ENTRY)) {
+    skip(name, 'host entry 없음');
+    return;
+  }
+  let w;
+  try {
+    const branch = 'feature/절단-확인';
+    // 같은 브랜치는 한 저장소에 여러 워크트리로 만들 수 없어 저장소 7개를 만든다.
+    const paths = [];
+    for (let i = 0; i < 7; i += 1) {
+      const { addWorktree } = makeRepo(`repo-i4-${i}`);
+      paths.push(addWorktree(branch, 'wt'));
+    }
+    const seeded = {};
+    for (const p of paths) seeded[p] = branch;
+    seedPending(seeded);
+
+    w = startWorker({
+      ORCA_BRANCH_EN_SLUG_CMD: 'echo "sample task"',
+      ORCA_BRANCH_EN_LOG: join(TMP, 'i4.log'),
+    });
+    w.init();
+    await w.next((m) => m.type === 'ready', 'ready');
+
+    w.send({ type: 'invokeCommand', callId: 304, commandId: 'rename-branch-en' });
+    const rc = await w.next(
+      (m) => m.type === 'hostCall' && m.method === 'workspace.readContext',
+      'workspace.readContext(i4)',
+    );
+    w.hostResult(rc.callId, { branch, displayName: 'x', terminals: [] });
+    const notif = await w.next(
+      (m) => m.type === 'hostCall' && m.method === 'notifications.show',
+      'notifications.show(i4)',
+    );
+    w.hostResult(notif.callId, { delivered: true });
+    const cmd = await w.next(
+      (m) => m.type === 'commandResult' && m.callId === 304,
+      'commandResult 304',
+    );
+
+    const body = notif.params && notif.params.body;
+    const lines = typeof body === 'string' ? body.split('\n') : [];
+    check(
+      `${name}: value.ok=false`,
+      cmd.ok === true && cmd.value && cmd.value.ok === false,
+      JSON.stringify(cmd),
+    );
+    check(`${name}: 본문 1000자 이하`, typeof body === 'string' && body.length <= 1000, `len=${body && body.length}`);
+    check(`${name}: 경로 5줄만 나열`, paths.slice(0, 5).every((p) => lines.includes(p)), JSON.stringify(lines));
+    check(
+      `${name}: 6·7번째 경로 없음`,
+      !lines.includes(paths[5]) && !lines.includes(paths[6]),
+      JSON.stringify(lines),
+    );
+    check(`${name}: 외 2개 표기`, typeof body === 'string' && body.includes('외 2개'), JSON.stringify(body));
+    check(`${name}: 브랜치 그대로`, paths.every((p) => branchOf(p) === branch));
+    check(
+      `${name}: terminal.sendText 없음`,
+      w.leftoverHostCalls().every((m) => m.method !== 'terminal.sendText'),
+      w.dump(),
+    );
+  } catch (err) {
+    fail(name, err.message);
+  } finally {
+    try {
+      w.child.kill();
+    } catch {
+      /* ignore */
+    }
+  }
+}
+
 async function main() {
   console.log(`== Orca 플러그인 호스트 테스트 ==`);
   console.log(`plugin root: ${ROOT}`);
@@ -962,6 +1271,10 @@ async function main() {
   await caseH2(h1);
   await caseH3();
   await caseH4();
+  await caseI1();
+  await caseI2();
+  await caseI3();
+  await caseI4();
 
   console.log('');
   console.log(`요약: PASS=${PASS} FAIL=${FAIL} SKIP=${SKIP}`);

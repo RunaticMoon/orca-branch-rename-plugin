@@ -9,6 +9,7 @@
 // 스크립트를 직접 실행한다.
 
 import { execFile } from 'node:child_process';
+import { existsSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { join } from 'node:path';
 
@@ -93,20 +94,38 @@ function reasonFromError(error) {
 // 워크트리 현재 브랜치를 git 에서 직접 읽는다.
 // pending 은 마지막으로 실행할 때의 기억이라 그 사이 누군가 브랜치를 바꿨거나 워크트리가
 // 사라졌을 수 있다. 실행 직전에 실제 값과 대조하려고 매번 git 에 물어본다.
-// 성공하면 trim 한 브랜치 문자열, 실패(경로 없음·git 아님·detached·timeout)면 null. throw 하지 않는다.
+//
+// "브랜치가 달라짐"과 "판독 불가"를 구분하려고 문자열 대신 상태 객체를 돌려준다. git 미설치·
+// PATH 오류·timeout 처럼 판독 자체가 안 되는 경우를 불일치로 오인해 멀쩡한 기억을 지우면
+// git 이 복구돼도 새 이벤트 전까지 수동 재시도가 막히기 때문이다. throw 하지 않는다.
+//   {state:'branch', branch} 성공(trim, 빈 문자열이면 unknown)
+//   {state:'gone'}            경로 자체가 없음
+//   {state:'detached'}        symbolic-ref 종료 코드 1(detached HEAD)
+//   {state:'unknown'}         그 밖의 판독 불가(ENOENT·timeout·기타 종료 코드)
 function currentBranch(worktreePath) {
   return new Promise((resolve) => {
+    // 경로가 없으면 git 을 부를 필요도 없다. '브랜치가 바뀜'과 구분되는 경로 소실 상태다.
+    if (!existsSync(worktreePath)) {
+      resolve({ state: 'gone' });
+      return;
+    }
     execFile(
       'git',
       ['-C', worktreePath, 'symbolic-ref', '--quiet', '--short', 'HEAD'],
       { timeout: 5000 },
       (error, stdout) => {
-        if (error) {
-          resolve(null);
+        if (!error) {
+          const branch = String(stdout || '').trim();
+          // 경로는 있는데 HEAD 가 비어 나오는 이상한 경우도 판독 불가로 본다.
+          resolve(branch === '' ? { state: 'unknown' } : { state: 'branch', branch });
           return;
         }
-        const branch = String(stdout || '').trim();
-        resolve(branch === '' ? null : branch);
+        // symbolic-ref --quiet 는 detached HEAD 에서만 종료 코드 1 로 조용히 끝난다.
+        if (error.code === 1) {
+          resolve({ state: 'detached' });
+          return;
+        }
+        resolve({ state: 'unknown' });
       },
     );
   });
@@ -125,23 +144,32 @@ function rememberPending(worktreePath, branch) {
 }
 
 // pending Map 을 storage 에 저장한다. 실패는 로그만 남기고 본 흐름을 막지 않는다.
-async function savePending(context) {
-  try {
-    await context.host.call('storage.set', {
-      key: PENDING_KEY,
-      value: Object.fromEntries(pending),
-    });
-  } catch (err) {
-    context.log(`pending 저장 실패: ${err && err.message ? err.message : String(err)}`);
-  }
+// 저장을 직렬화한다. 서로 다른 worktree.created 가 겹치면 Map 변경(동기)은 앞서도 storage.set
+// 완료 순서가 뒤집혀 이전 스냅샷이 최신 스냅샷을 덮어쓸 수 있다(lost-update). 체인에 이어 붙여
+// 이전 저장이 끝난 뒤에 다음 저장을 시작하고, 스냅샷은 실행 시점의 pending 으로 뜬다.
+let saveChain = Promise.resolve();
+function savePending(context) {
+  saveChain = saveChain.then(async () => {
+    try {
+      await context.host.call('storage.set', {
+        key: PENDING_KEY,
+        value: Object.fromEntries(pending),
+      });
+    } catch (err) {
+      context.log(`pending 저장 실패: ${err && err.message ? err.message : String(err)}`);
+    }
+  });
+  return saveChain;
 }
 
 // 실패·skip 처리 뒤 pending 을 정리한다.
-// 기억한 한글 브랜치에서 실제 브랜치가 이미 달라졌거나(누군가 먼저 바꿈) 읽을 수 없으면
-// (경로 소실·detached) 그 기억은 더 이상 쓸모가 없어 지운다. 그대로면 수동 재시도를 위해 남긴다.
+// 기억한 한글 브랜치에서 실제 브랜치가 이미 달라졌거나(누군가 먼저 바꿈) 워크트리가 사라졌거나
+// (경로 소실) detached 가 되면 그 기억은 더 이상 쓸모가 없어 지운다. 그대로면 수동 재시도를 위해
+// 남긴다. 'unknown'(git 미설치·PATH 오류·timeout 등 판독 불가)은 바뀌었다고 단정할 수 없어 보존한다.
 async function forgetIfStale(context, worktreePath, branch) {
   const cur = await currentBranch(worktreePath);
-  if (cur === branch) return;
+  if (cur.state === 'unknown') return;
+  if (cur.state === 'branch' && cur.branch === branch) return;
   pending.delete(worktreePath);
   await savePending(context);
 }
@@ -210,6 +238,12 @@ async function processWorktree(context, worktreePath, branch) {
   } catch (err) {
     // 예외가 새어 나가도 ack 는 되지만, 직접 로그해 둔다.
     context.log(`워크트리 처리 중 오류: ${err && err.message ? err.message : String(err)}`);
+    // 정상 흐름에서 못 한 기억 정리를 여기서도 시도한다. 그 자체가 예외를 내도 본 오류를 덮지 않게 삼킨다.
+    try {
+      await forgetIfStale(context, worktreePath, branch);
+    } catch {
+      // 정리 실패는 무시한다.
+    }
     return 'error';
   } finally {
     running.delete(worktreePath);
@@ -227,6 +261,26 @@ async function onWorktreeCreated(context, payload) {
     await processWorktree(context, worktreePath, branch);
   } catch (err) {
     context.log(`worktree.created 처리 중 오류: ${err && err.message ? err.message : String(err)}`);
+  }
+}
+
+// '고를 수 없음' 알림 본문을 만든다. 경로는 최대 5줄만 나열하고 넘치면 마지막 줄에 '외 N개'로
+// 요약한다. 알림 쪽에도 1000자 제한이 있지만 여기서 미리 줄여 경로가 중간에서 잘리지 않게 한다.
+function cannotChooseBody(paths) {
+  const HEADER =
+    '같은 이름의 브랜치가 여러 워크트리에 있어 고를 수 없습니다. 워크트리 폴더의 터미널에서 직접 실행하세요:';
+  const SCRIPT_LINE = `/bin/bash ${scriptPath}`;
+  const LIMIT = 1000;
+  const MAX_PATHS = 5;
+  let shown = Math.min(paths.length, MAX_PATHS);
+  // 1000자를 넘칠 것 같으면 경로 줄을 하나씩 줄이고 '외 N개'를 늘린다. 0줄이면 어쩔 수 없이 자른다.
+  while (true) {
+    const rest = paths.length - shown;
+    const lines = [HEADER, SCRIPT_LINE, ...paths.slice(0, shown)];
+    if (rest > 0) lines.push(`외 ${rest}개`);
+    const body = lines.join('\n');
+    if (body.length <= LIMIT || shown === 0) return body.slice(0, LIMIT);
+    shown -= 1;
   }
 }
 
@@ -249,30 +303,57 @@ async function renameBranchEn(context) {
     return { ok: false };
   }
 
-  // pending(경로→브랜치)에서 같은 한글 브랜치를 가리키는 후보 경로를 모은다.
-  // 알림 본문이 커지지 않도록 상한을 둔다(같은 이름이 이보다 많으면 어차피 고를 수 없다).
+  // pending(경로→브랜치)에서 같은 한글 브랜치를 가리키는 후보 경로를 모두 모은다.
+  // 예전에는 10개에서 끊어 11번째 이후의 진짜 일치를 놓칠 수 있었다. 이제 전부 모아 상한을
+  // 넘으면 git 확인 없이 "너무 많아 고를 수 없음"으로 거절한다(일부만 보고 잘못 실행하지 않게).
   const candidates = [];
   for (const [worktreePath, remembered] of pending) {
-    if (remembered === branch) {
-      candidates.push(worktreePath);
-      if (candidates.length >= 10) break;
-    }
+    if (remembered === branch) candidates.push(worktreePath);
+  }
+  if (candidates.length > 10) {
+    await notify(
+      context,
+      '브랜치 이름 바꾸기',
+      `같은 이름의 브랜치가 너무 많아 고를 수 없습니다. 워크트리 폴더의 터미널에서 직접 실행하세요:\n/bin/bash ${scriptPath}`,
+    );
+    return { ok: false };
   }
 
   // 기억은 실행 시점의 값이라 그 사이 브랜치가 바뀌었을 수 있다. 실제 브랜치와 대조해
   // 더 이상 그 한글 브랜치가 아닌 후보는 지운다(변경이 있을 때만 한 번 저장한다).
+  // 'unknown'(git 미설치·PATH·timeout 등 판독 불가)은 바뀌었다고 단정할 수 없어 지우지 않는다.
   const current = await Promise.all(candidates.map((p) => currentBranch(p)));
   const matches = [];
+  const unknownPaths = [];
   let pruned = false;
   for (let i = 0; i < candidates.length; i += 1) {
-    if (current[i] === branch) {
-      matches.push(candidates[i]);
-    } else {
-      pending.delete(candidates[i]);
-      pruned = true;
+    const path = candidates[i];
+    const state = current[i];
+    if (state.state === 'branch' && state.branch === branch) {
+      matches.push(path);
+      continue;
     }
+    if (state.state === 'unknown') {
+      unknownPaths.push(path);
+      continue;
+    }
+    // 실행 중인 경로는 지금 브랜치가 바뀌는 중일 수 있어 기억을 지우지 않고 보류한다.
+    if (running.has(path)) continue;
+    pending.delete(path);
+    pruned = true;
   }
   if (pruned) await savePending(context);
+
+  // 일치가 없는데 판독 불가 후보만 있으면 "경로를 모름"이 아니라 git 실행 실패를 안내한다.
+  // 기억은 지우지 않았으므로 잠시 뒤 재시도하면 된다.
+  if (matches.length === 0 && unknownPaths.length > 0) {
+    await notify(
+      context,
+      '브랜치 이름 바꾸기',
+      `브랜치를 확인할 수 없습니다(git 실행 실패). 잠시 후 다시 시도하거나 워크트리 폴더의 터미널에서 직접 실행하세요: /bin/bash ${scriptPath}`,
+    );
+    return { ok: false };
+  }
 
   // 경로를 모르면 터미널에 타이핑하는 대신 직접 실행하도록 안내한다.
   if (matches.length === 0) {
@@ -286,13 +367,10 @@ async function renameBranchEn(context) {
 
   // 같은 한글 브랜치가 여러 저장소의 워크트리에 있으면 어느 것인지 가릴 수 없다.
   // 엉뚱한 저장소를 건드리지 않도록 아무 것도 실행하지 않고 후보 경로만 알려 준다.
-  if (matches.length > 1) {
-    const body = [
-      '같은 이름의 브랜치가 여러 워크트리에 있어 고를 수 없습니다. 워크트리 폴더의 터미널에서 직접 실행하세요:',
-      `/bin/bash ${scriptPath}`,
-      ...matches,
-    ].join('\n');
-    await notify(context, '브랜치 이름 바꾸기', body.slice(0, 1000));
+  // 일치가 하나뿐이어도 판독 불가 후보가 섞여 있으면 그 하나가 맞다고 단정할 수 없다.
+  if (matches.length > 1 || unknownPaths.length > 0) {
+    const body = cannotChooseBody(matches.concat(unknownPaths));
+    await notify(context, '브랜치 이름 바꾸기', body);
     return { ok: false };
   }
 
