@@ -286,8 +286,9 @@ else
         PATH=/usr/bin:/bin HOME="$fakehome" ORCA_BRANCH_EN_CLAUDE=/nonexistent \
         ORCA_BRANCH_EN_LOG="$log" bash "$TARGET" "$wt" >/dev/null 2>&1)
   RC=$?
-  if [ "$RC" -eq 0 ] && [ "$(branch_of "$wt")" = "feature/한글-클로드없음" ]; then
-    pass "case12 claude 미발견 시 조용히 종료(코드 0, 브랜치 유지)"
+  if [ "$RC" -eq 0 ] && [ "$(branch_of "$wt")" = "feature/한글-클로드없음" ] \
+     && grep -qF "fail: claude 실행 파일을 찾을 수 없음" "$log"; then
+    pass "case12 claude 미발견 시 fail 기록(코드 0, 브랜치 유지)"
   else
     fail "case12 claude 미발견 (rc=$RC branch=$(branch_of "$wt"))"
   fi

@@ -27,8 +27,10 @@ const running = new Set();
 // deactivate 때 정리할 진행 중 자식 프로세스.
 const children = new Set();
 
-// 수동 커맨드가 대상을 찾을 수 있게 워크트리 경로를 브랜치 이름으로 기억한다.
-// 삽입 순서를 유지하고, storage 에도 저장해 워커가 재시작해도 남는다.
+// 수동 커맨드가 대상을 찾을 수 있게 워크트리 경로를 키로, 그때의 브랜치 이름을 값으로 기억한다.
+// 브랜치 이름을 키로 쓰면 서로 다른 저장소의 같은 한글 브랜치가 서로를 덮어써 엉뚱한 저장소의
+// 워크트리를 실행할 수 있어서 경로를 키로 삼는다. 삽입 순서를 유지하고, storage 에도 저장해
+// 워커가 재시작해도 남는다.
 const pending = new Map();
 const PENDING_KEY = 'pending';
 const PENDING_MAX = 200;
@@ -88,9 +90,34 @@ function reasonFromError(error) {
   return (error && error.message) || '알 수 없는 오류';
 }
 
-// pending 에 경로를 기억한다. 상한을 넘으면 가장 오래된 것부터 버린다(삽입 순서 유지).
-function rememberPending(branch, worktreePath) {
-  pending.set(branch, worktreePath);
+// 워크트리 현재 브랜치를 git 에서 직접 읽는다.
+// pending 은 마지막으로 실행할 때의 기억이라 그 사이 누군가 브랜치를 바꿨거나 워크트리가
+// 사라졌을 수 있다. 실행 직전에 실제 값과 대조하려고 매번 git 에 물어본다.
+// 성공하면 trim 한 브랜치 문자열, 실패(경로 없음·git 아님·detached·timeout)면 null. throw 하지 않는다.
+function currentBranch(worktreePath) {
+  return new Promise((resolve) => {
+    execFile(
+      'git',
+      ['-C', worktreePath, 'symbolic-ref', '--quiet', '--short', 'HEAD'],
+      { timeout: 5000 },
+      (error, stdout) => {
+        if (error) {
+          resolve(null);
+          return;
+        }
+        const branch = String(stdout || '').trim();
+        resolve(branch === '' ? null : branch);
+      },
+    );
+  });
+}
+
+// pending 에 경로를 키로 기억한다. 같은 키를 다시 넣으면 지웠다가 넣어 최근 순서로 올린다.
+// 그러지 않으면 상한(200)을 넘을 때 Map 의 오래된 순서 그대로 최근 것부터 축출될 수 있다.
+// 상한을 넘으면 가장 오래된 것부터 버린다(삽입 순서 유지).
+function rememberPending(worktreePath, branch) {
+  pending.delete(worktreePath);
+  pending.set(worktreePath, branch);
   while (pending.size > PENDING_MAX) {
     const oldest = pending.keys().next().value;
     pending.delete(oldest);
@@ -109,6 +136,16 @@ async function savePending(context) {
   }
 }
 
+// 실패·skip 처리 뒤 pending 을 정리한다.
+// 기억한 한글 브랜치에서 실제 브랜치가 이미 달라졌거나(누군가 먼저 바꿈) 읽을 수 없으면
+// (경로 소실·detached) 그 기억은 더 이상 쓸모가 없어 지운다. 그대로면 수동 재시도를 위해 남긴다.
+async function forgetIfStale(context, worktreePath, branch) {
+  const cur = await currentBranch(worktreePath);
+  if (cur === branch) return;
+  pending.delete(worktreePath);
+  await savePending(context);
+}
+
 // 워크트리 하나를 처리한다.
 // 반환: 'none'(ASCII) | 'busy' | 'renamed' | 'fail' | 'skip' | 'error'.
 async function processWorktree(context, worktreePath, branch) {
@@ -122,7 +159,7 @@ async function processWorktree(context, worktreePath, branch) {
   running.add(worktreePath);
   try {
     // 실행 전에 먼저 기억해 둔다. 실패·skip 이어도 경로는 남겨 수동 재시도를 돕는다.
-    rememberPending(branch, worktreePath);
+    rememberPending(worktreePath, branch);
     await savePending(context);
 
     const { error, stdout, stderr } = await runScript(worktreePath);
@@ -138,10 +175,16 @@ async function processWorktree(context, worktreePath, branch) {
         ? line.slice(line.indexOf(failMarker) + failMarker.length)
         : reasonFromError(error);
       await notify(context, '브랜치 이름 바꾸기 실패', body);
+      // 결과 줄이 없어 실제로 바뀌었는지 알 수 없으므로 git 과 대조해 필요 없어진 기억을 지운다.
+      await forgetIfStale(context, worktreePath, branch);
       return 'error';
     }
 
-    if (!line) return 'skip'; // 결과 줄이 없으면 알릴 것이 없다.
+    if (!line) {
+      // 결과 줄이 없으면 알릴 것이 없다. 다만 브랜치가 이미 영어면 기억을 지워 잔류를 막는다.
+      await forgetIfStale(context, worktreePath, branch);
+      return 'skip';
+    }
 
     if (line.includes('renamed: ')) {
       // 스크립트는 'old -> new' 로 쓰지만 사람이 읽기 쉽게 '→' 로 바꿔 알린다.
@@ -151,15 +194,18 @@ async function processWorktree(context, worktreePath, branch) {
       const body = at === -1 ? rest : `${rest.slice(0, at)} → ${rest.slice(at + sep.length)}`;
       await notify(context, '브랜치 이름을 바꿨습니다', body);
       // 성공했으면 이제 필요 없는 기억을 지우고 저장한다.
-      pending.delete(branch);
+      pending.delete(worktreePath);
       await savePending(context);
       return 'renamed';
     }
     if (line.includes('fail: ')) {
       await notify(context, '브랜치 이름 바꾸기 실패', line.slice(line.indexOf('fail: ') + 'fail: '.length));
+      // 실패해도 브랜치가 이미 바뀌었을 수 있어 git 과 대조해 잔류를 정리한다.
+      await forgetIfStale(context, worktreePath, branch);
       return 'fail';
     }
-    // 'skip:' 은 로그만 남기고 알리지 않는다. 기억은 남겨 둔다.
+    // 'skip:' 은 로그만 남기고 알리지 않는다. 브랜치가 그대로면 재시도를 위해 기억은 남긴다.
+    await forgetIfStale(context, worktreePath, branch);
     return 'skip';
   } catch (err) {
     // 예외가 새어 나가도 ack 는 되지만, 직접 로그해 둔다.
@@ -203,8 +249,33 @@ async function renameBranchEn(context) {
     return { ok: false };
   }
 
+  // pending(경로→브랜치)에서 같은 한글 브랜치를 가리키는 후보 경로를 모은다.
+  // 알림 본문이 커지지 않도록 상한을 둔다(같은 이름이 이보다 많으면 어차피 고를 수 없다).
+  const candidates = [];
+  for (const [worktreePath, remembered] of pending) {
+    if (remembered === branch) {
+      candidates.push(worktreePath);
+      if (candidates.length >= 10) break;
+    }
+  }
+
+  // 기억은 실행 시점의 값이라 그 사이 브랜치가 바뀌었을 수 있다. 실제 브랜치와 대조해
+  // 더 이상 그 한글 브랜치가 아닌 후보는 지운다(변경이 있을 때만 한 번 저장한다).
+  const current = await Promise.all(candidates.map((p) => currentBranch(p)));
+  const matches = [];
+  let pruned = false;
+  for (let i = 0; i < candidates.length; i += 1) {
+    if (current[i] === branch) {
+      matches.push(candidates[i]);
+    } else {
+      pending.delete(candidates[i]);
+      pruned = true;
+    }
+  }
+  if (pruned) await savePending(context);
+
   // 경로를 모르면 터미널에 타이핑하는 대신 직접 실행하도록 안내한다.
-  if (!pending.has(branch)) {
+  if (matches.length === 0) {
     await notify(
       context,
       '브랜치 이름 바꾸기',
@@ -213,7 +284,19 @@ async function renameBranchEn(context) {
     return { ok: false };
   }
 
-  const worktreePath = pending.get(branch);
+  // 같은 한글 브랜치가 여러 저장소의 워크트리에 있으면 어느 것인지 가릴 수 없다.
+  // 엉뚱한 저장소를 건드리지 않도록 아무 것도 실행하지 않고 후보 경로만 알려 준다.
+  if (matches.length > 1) {
+    const body = [
+      '같은 이름의 브랜치가 여러 워크트리에 있어 고를 수 없습니다. 워크트리 폴더의 터미널에서 직접 실행하세요:',
+      `/bin/bash ${scriptPath}`,
+      ...matches,
+    ].join('\n');
+    await notify(context, '브랜치 이름 바꾸기', body.slice(0, 1000));
+    return { ok: false };
+  }
+
+  const worktreePath = matches[0];
   if (running.has(worktreePath)) {
     await notify(context, '브랜치 이름 바꾸기', '이미 실행 중입니다');
     return { ok: false };
@@ -233,9 +316,9 @@ export default async function activate(context) {
     const res = await context.host.call('storage.get', { key: PENDING_KEY });
     const stored = res && res.value;
     if (stored && typeof stored === 'object' && !Array.isArray(stored)) {
-      for (const [branch, worktreePath] of Object.entries(stored)) {
-        if (typeof branch === 'string' && typeof worktreePath === 'string') {
-          rememberPending(branch, worktreePath);
+      for (const [worktreePath, branch] of Object.entries(stored)) {
+        if (typeof worktreePath === 'string' && typeof branch === 'string') {
+          rememberPending(worktreePath, branch);
         }
       }
     }

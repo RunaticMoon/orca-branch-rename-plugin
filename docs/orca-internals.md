@@ -18,7 +18,7 @@ grep -rl 'autoRenameBranchFromWork' "$tmp" | head
 
 ### 매니페스트
 
-- 파일 이름은 `orca-plugin.json`이다. Zod `strict` 검증이라 모르는 키가 있으면 거부된다.
+- 파일 이름은 `orca-plugin.json`이다. Zod로 검증한다. `contributes`와 각 capability 객체는 `strict`라 모르는 키가 있으면 거부되고, 최상위·`commands[i]`·`events[i]`는 `strict`가 아니다.
 - 필수: `manifestVersion: 1`, `id`, `publisher`, `name`, `version`(semver), `engines.orca`(`">=x.y.z"`), `pluginApi: 1`.
   - `id`와 `publisher`는 kebab-case여야 한다.
 - 선택: `description`, `author`, `repository`, `icon`, `main`.
@@ -55,7 +55,7 @@ grep -rl 'autoRenameBranchFromWork' "$tmp" | head
 1. Settings → Plugins → **Plugin system**(Experimental)을 켠다. 설정 키는 `pluginSystemEnabled`이고 기본값은 꺼짐이다.
 2. 설치 방법은 셋 중 하나다.
    - **Install plugin → Local folder**: `orca-plugin.json`이 있는 폴더의 절대경로를 넣는다.
-   - **Install plugin → Git URL**: HTTPS·SSH URL 뒤에 `#태그` 또는 `#커밋`을 반드시 붙인다.
+   - **Install plugin → Git URL**: HTTPS·SSH URL 뒤에 `#태그` 또는 `#커밋`을 반드시 붙인다. 태그는 원격에 push되어 있어야 한다.
    - **Development**: 플러그인 폴더를 `devPluginPaths`에 추가한다. 복사하지 않고 그 자리에서 불러온다.
 3. 권한 검토 창에서 **Enable plugin**을 누른다. 그 전에는 코드가 실행되지 않는다. 권한이나 워커 여부가 바뀌면 다시 검토해야 한다.
 
@@ -65,7 +65,8 @@ grep -rl 'autoRenameBranchFromWork' "$tmp" | head
 
 ### 이 플러그인의 선택
 
-- `workspace.readContext`가 경로를 주지 않으므로 수동 명령은 `worktree.created`에서 받은 `branch → path`를 storage 키 `pending`에 기억해 두고 쓴다(최대 200개, 성공하면 지운다).
+- `workspace.readContext`가 경로를 주지 않으므로 수동 명령은 `worktree.created`에서 받은 `path → branch`를 storage 키 `pending`에 기억해 두고 쓴다(최대 200개, 성공하거나 브랜치가 이미 바뀌었으면 지운다).
+  - 수동 명령은 현재 브랜치와 같은 이름으로 기억된 경로마다 `git symbolic-ref`로 실제 브랜치를 다시 확인한다. 저장소가 달라도 브랜치 이름이 같을 수 있기 때문이다. 일치하는 경로가 둘 이상이면 실행하지 않고 알린다.
 - `terminal.sendText`는 쓰지 않는다. 첫 터미널에서 에이전트 TUI가 돌고 있으면 입력이 프롬프트로 들어가기 때문이다.
 - 명령 제한이 30초라 수동 명령은 스크립트를 시작만 하고 바로 반환한다. 결과는 알림으로 알린다.
 

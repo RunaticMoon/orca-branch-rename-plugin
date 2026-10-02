@@ -29,14 +29,28 @@ const SCRIPT_PATH = join(ROOT, 'bin', 'orca-branch-en.sh');
 
 // 플러그인이 storage.set/get 으로 쓰는 값. 워커(자식 프로세스)들끼리 공유해
 // 재시작 후에도 pending 이 남아 있는지 검증할 수 있게 한다.
+// pending 은 이제 Map<워크트리 경로, 브랜치 이름> 이므로 객체도 { [path]: branch } 모양이다.
 const SHARED_STORAGE = new Map();
 const PENDING_KEY = 'pending';
 function pendingValue() {
   const v = SHARED_STORAGE.get(PENDING_KEY);
   return v && typeof v === 'object' && !Array.isArray(v) ? v : {};
 }
-function pendingHas(branch) {
-  return Object.prototype.hasOwnProperty.call(pendingValue(), branch);
+function pendingHasPath(path) {
+  return Object.prototype.hasOwnProperty.call(pendingValue(), path);
+}
+function pendingBranchOf(path) {
+  return pendingValue()[path];
+}
+// 같은 브랜치를 가리키는 pending 경로 목록. 충돌·정리 검증에 쓴다.
+function pendingPathsFor(branch) {
+  return Object.entries(pendingValue())
+    .filter(([, value]) => value === branch)
+    .map(([path]) => path);
+}
+// pending 의 초기 상태를 특정 객체로 시드한다(이전 케이스의 잔여 값 제거 포함).
+function seedPending(obj) {
+  SHARED_STORAGE.set(PENDING_KEY, obj);
 }
 
 // 플랫폼별 기본 Orca 리소스 위치. 실제로 존재하는 쪽을 고른다.
@@ -335,13 +349,13 @@ async function caseC() {
     const bodyOk = call.params && call.params.body === 'feature/샘플-작업 → feature/sample-task';
     check(`${name}: 알림 내용`, titleOk && bodyOk, JSON.stringify(call.params));
 
-    // 실행 전에 pending 이 기록됐다가, renamed 후 제거됐는지 본다.
+    // 실행 전에 pending(경로 키)이 기록됐다가, renamed 후 제거됐는지 본다.
     const recorded = w
       .storageCalls()
       .filter((m) => m.method === 'storage.set')
-      .some((m) => m.params && m.params.value && Object.prototype.hasOwnProperty.call(m.params.value, 'feature/샘플-작업'));
+      .some((m) => m.params && m.params.value && m.params.value[wt] === 'feature/샘플-작업');
     check(`${name}: 실행 전 pending 기록`, recorded, JSON.stringify(w.storageCalls()));
-    check(`${name}: renamed 후 pending 제거`, !pendingHas('feature/샘플-작업'), JSON.stringify(pendingValue()));
+    check(`${name}: renamed 후 pending 제거`, !pendingHasPath(wt), JSON.stringify(pendingValue()));
   } catch (err) {
     fail(name, err.message);
   } finally {
@@ -443,7 +457,11 @@ async function caseE() {
       JSON.stringify(call.params),
     );
     // 실패했으니 pending 에 경로가 남아 있어야 이후 수동 재시도가 가능하다.
-    check(`${name}: 실패 후 pending 유지`, pendingHas('feature/한글-실패'), JSON.stringify(pendingValue()));
+    check(
+      `${name}: 실패 후 pending 유지`,
+      pendingHasPath(wt) && pendingBranchOf(wt) === 'feature/한글-실패',
+      JSON.stringify(pendingValue()),
+    );
     return { wt, branch: 'feature/한글-실패' };
   } catch (err) {
     fail(name, err.message);
@@ -501,7 +519,7 @@ async function caseF(eInfo) {
       'notifications.show(f1)',
     );
     w.hostResult(notif1.callId, { delivered: true });
-    await waitFor(() => branchOf(eInfo.wt) === 'feature/sample-task' && !pendingHas(eInfo.branch));
+    await waitFor(() => branchOf(eInfo.wt) === 'feature/sample-task' && !pendingHasPath(eInfo.wt));
     check(
       `${name}: f1 브랜치 영어로 변경`,
       branchOf(eInfo.wt) === 'feature/sample-task',
@@ -512,7 +530,7 @@ async function caseF(eInfo) {
       notif1.params && notif1.params.title === '브랜치 이름을 바꿨습니다',
       JSON.stringify(notif1.params),
     );
-    check(`${name}: f1 pending 제거`, !pendingHas(eInfo.branch), JSON.stringify(pendingValue()));
+    check(`${name}: f1 pending 제거`, !pendingHasPath(eInfo.wt), JSON.stringify(pendingValue()));
 
     // f2: readContext null → value.ok=false
     w.send({ type: 'invokeCommand', callId: 102, commandId: 'rename-branch-en' });
@@ -630,6 +648,296 @@ async function caseG() {
   }
 }
 
+// ---------------------------------------------------------------------------
+// 케이스 h1: 같은 한글 브랜치가 두 저장소에 있으면 고르지 않고 안내만
+// ---------------------------------------------------------------------------
+async function caseH1() {
+  const name = 'h1 같은 브랜치 충돌 안내';
+  if (!existsSync(HOST_ENTRY)) {
+    skip(name, 'host entry 없음');
+    return null;
+  }
+  let w;
+  try {
+    const branch = 'feature/알림-설정';
+    const a = makeRepo('repo-h1a');
+    const b = makeRepo('repo-h1b');
+    const wt1 = a.addWorktree(branch, 'wt');
+    const wt2 = b.addWorktree(branch, 'wt');
+    // 서로 다른 저장소의 같은 한글 브랜치 두 경로가 기억된 상태를 시드한다.
+    seedPending({ [wt1]: branch, [wt2]: branch });
+
+    w = startWorker({
+      ORCA_BRANCH_EN_SLUG_CMD: 'echo "sample task"',
+      ORCA_BRANCH_EN_LOG: join(TMP, 'h1.log'),
+    });
+    w.init();
+    await w.next((m) => m.type === 'ready', 'ready');
+
+    w.send({ type: 'invokeCommand', callId: 201, commandId: 'rename-branch-en' });
+    const rc = await w.next(
+      (m) => m.type === 'hostCall' && m.method === 'workspace.readContext',
+      'workspace.readContext(h1)',
+    );
+    w.hostResult(rc.callId, { branch, displayName: 'x', terminals: [] });
+
+    const notif = await w.next(
+      (m) => m.type === 'hostCall' && m.method === 'notifications.show',
+      'notifications.show(h1)',
+    );
+    w.hostResult(notif.callId, { delivered: true });
+    const cmd = await w.next(
+      (m) => m.type === 'commandResult' && m.callId === 201,
+      'commandResult 201',
+    );
+
+    check(
+      `${name}: value.ok=false`,
+      cmd.ok === true && cmd.value && cmd.value.ok === false,
+      JSON.stringify(cmd),
+    );
+    const body = notif.params && notif.params.body;
+    check(
+      `${name}: 알림 body 에 두 경로`,
+      typeof body === 'string' && body.includes(wt1) && body.includes(wt2),
+      JSON.stringify(notif.params),
+    );
+    check(`${name}: 두 브랜치 그대로`, branchOf(wt1) === branch && branchOf(wt2) === branch);
+    check(
+      `${name}: terminal.sendText 없음`,
+      w.leftoverHostCalls().every((m) => m.method !== 'terminal.sendText'),
+      w.dump(),
+    );
+    return { branch, wt1, wt2 };
+  } catch (err) {
+    fail(name, err.message);
+    return null;
+  } finally {
+    try {
+      w.child.kill();
+    } catch {
+      /* ignore */
+    }
+  }
+}
+
+// ---------------------------------------------------------------------------
+// 케이스 h2: 한쪽이 이미 영어로 바뀐 충돌 → 남은 하나만 실행하고 바뀐 쪽 기억 제거
+// ---------------------------------------------------------------------------
+async function caseH2(h1) {
+  const name = 'h2 한쪽이 이미 바뀐 충돌';
+  if (!existsSync(HOST_ENTRY)) {
+    skip(name, 'host entry 없음');
+    return;
+  }
+  if (!h1) {
+    skip(name, 'h1 정보 없음');
+    return;
+  }
+  let w;
+  try {
+    const { branch, wt1, wt2 } = h1;
+    // 첫 번째 워크트리는 이미 영어 브랜치로 바뀐 상태를 만든다.
+    git(['branch', '-m', branch, 'feature/notification-settings'], wt1);
+    // pending 은 아직 두 경로를 가리킨다고 가정한다(h1 은 지우지 않음).
+    seedPending({ [wt1]: branch, [wt2]: branch });
+
+    w = startWorker({
+      ORCA_BRANCH_EN_SLUG_CMD: 'echo "sample task"',
+      ORCA_BRANCH_EN_LOG: join(TMP, 'h2.log'),
+    });
+    w.init();
+    await w.next((m) => m.type === 'ready', 'ready');
+
+    w.send({ type: 'invokeCommand', callId: 202, commandId: 'rename-branch-en' });
+    const rc = await w.next(
+      (m) => m.type === 'hostCall' && m.method === 'workspace.readContext',
+      'workspace.readContext(h2)',
+    );
+    w.hostResult(rc.callId, { branch, displayName: 'x', terminals: [] });
+
+    const cmd = await w.next(
+      (m) => m.type === 'commandResult' && m.callId === 202,
+      'commandResult 202',
+    );
+    check(
+      `${name}: 남은 하나만 started`,
+      cmd.ok === true && cmd.value && cmd.value.ok === true && cmd.value.started === true,
+      JSON.stringify(cmd),
+    );
+
+    const notif = await w.next(
+      (m) => m.type === 'hostCall' && m.method === 'notifications.show',
+      'notifications.show(h2)',
+    );
+    w.hostResult(notif.callId, { delivered: true });
+    await waitFor(() => branchOf(wt2) === 'feature/sample-task' && !pendingHasPath(wt1));
+
+    check(
+      `${name}: 남은 브랜치 영어로 변경`,
+      branchOf(wt2) === 'feature/sample-task',
+      `branch=${branchOf(wt2)}`,
+    );
+    check(`${name}: 바뀐 쪽 경로 제거`, !pendingHasPath(wt1), JSON.stringify(pendingValue()));
+    check(
+      `${name}: terminal.sendText 없음`,
+      w.leftoverHostCalls().every((m) => m.method !== 'terminal.sendText'),
+      w.dump(),
+    );
+  } catch (err) {
+    fail(name, err.message);
+  } finally {
+    try {
+      w.child.kill();
+    } catch {
+      /* ignore */
+    }
+  }
+}
+
+// ---------------------------------------------------------------------------
+// 케이스 h3: payload 는 한글인데 실제 브랜치는 이미 ASCII → 잔류 기억 제거
+// ---------------------------------------------------------------------------
+async function caseH3() {
+  const name = 'h3 잔류 pending 정리';
+  if (!existsSync(HOST_ENTRY)) {
+    skip(name, 'host entry 없음');
+    return;
+  }
+  let w;
+  try {
+    // 이전 케이스의 잔여가 섞이지 않게 비워 둔다.
+    seedPending({});
+    w = startWorker({
+      ORCA_BRANCH_EN_SLUG_CMD: 'echo "sample task"',
+      ORCA_BRANCH_EN_LOG: join(TMP, 'h3.log'),
+    });
+    w.init();
+    await w.next((m) => m.type === 'ready', 'ready');
+
+    const { addWorktree } = makeRepo('repo-h3');
+    const wt = addWorktree('feature/already-english', 'wt');
+
+    w.send({
+      type: 'deliverEvent',
+      eventId: 31,
+      event: 'worktree.created',
+      payload: { worktreeId: `repo::${wt}`, path: wt, branch: 'feature/한글-잔류' },
+    });
+    await w.next((m) => m.type === 'eventAck' && m.eventId === 31, 'eventAck');
+
+    check(`${name}: 브랜치 그대로`, branchOf(wt) === 'feature/already-english', `branch=${branchOf(wt)}`);
+    check(`${name}: 잔류 기억 제거`, !pendingHasPath(wt), JSON.stringify(pendingValue()));
+    check(
+      `${name}: terminal.sendText 없음`,
+      w.leftoverHostCalls().every((m) => m.method !== 'terminal.sendText'),
+      w.dump(),
+    );
+  } catch (err) {
+    fail(name, err.message);
+  } finally {
+    try {
+      w.child.kill();
+    } catch {
+      /* ignore */
+    }
+  }
+}
+
+// ---------------------------------------------------------------------------
+// 케이스 h4: 같은 워크트리에 수동 커맨드가 겹치면 두 번째는 거절
+// ---------------------------------------------------------------------------
+async function caseH4() {
+  const name = 'h4 실행 중 중복 명령 차단';
+  if (!existsSync(HOST_ENTRY)) {
+    skip(name, 'host entry 없음');
+    return;
+  }
+  let w;
+  try {
+    const branch = 'feature/지연-작업';
+    const { addWorktree } = makeRepo('repo-h4');
+    const wt = addWorktree(branch, 'wt');
+    seedPending({ [wt]: branch });
+
+    w = startWorker({
+      // 첫 실행이 running 에 머무는 동안 두 번째가 겹치도록 slug 명령을 늦춘다.
+      ORCA_BRANCH_EN_SLUG_CMD: 'sleep 2; echo "sample task"',
+      ORCA_BRANCH_EN_LOG: join(TMP, 'h4.log'),
+    });
+    w.init();
+    await w.next((m) => m.type === 'ready', 'ready');
+
+    // 첫 번째 명령: 즉시 started 를 돌려주고 백그라운드로 리네임한다.
+    w.send({ type: 'invokeCommand', callId: 203, commandId: 'rename-branch-en' });
+    const rc1 = await w.next(
+      (m) => m.type === 'hostCall' && m.method === 'workspace.readContext',
+      'workspace.readContext(h4-1)',
+    );
+    w.hostResult(rc1.callId, { branch, displayName: 'x', terminals: [] });
+    const cmd1 = await w.next(
+      (m) => m.type === 'commandResult' && m.callId === 203,
+      'commandResult 203',
+    );
+    check(
+      `${name}: 첫 명령 started`,
+      cmd1.ok === true && cmd1.value && cmd1.value.started === true,
+      JSON.stringify(cmd1),
+    );
+
+    // 두 번째 명령: 아직 실행 중이라 거절되어야 한다.
+    w.send({ type: 'invokeCommand', callId: 204, commandId: 'rename-branch-en' });
+    const rc2 = await w.next(
+      (m) => m.type === 'hostCall' && m.method === 'workspace.readContext',
+      'workspace.readContext(h4-2)',
+    );
+    w.hostResult(rc2.callId, { branch, displayName: 'x', terminals: [] });
+    const notif2 = await w.next(
+      (m) => m.type === 'hostCall' && m.method === 'notifications.show',
+      'notifications.show(h4-busy)',
+    );
+    w.hostResult(notif2.callId, { delivered: true });
+    const cmd2 = await w.next(
+      (m) => m.type === 'commandResult' && m.callId === 204,
+      'commandResult 204',
+    );
+    check(
+      `${name}: 두 번째 value.ok=false`,
+      cmd2.ok === true && cmd2.value && cmd2.value.ok === false,
+      JSON.stringify(cmd2),
+    );
+    check(
+      `${name}: 이미 실행 중 알림`,
+      notif2.params && notif2.params.body === '이미 실행 중입니다',
+      JSON.stringify(notif2.params),
+    );
+
+    // 첫 실행이 2초 뒤 끝나며 성공 알림을 보낸다.
+    const notif1 = await w.next(
+      (m) => m.type === 'hostCall' && m.method === 'notifications.show',
+      'notifications.show(h4-done)',
+    );
+    w.hostResult(notif1.callId, { delivered: true });
+    await waitFor(() => branchOf(wt) === 'feature/sample-task' && !pendingHasPath(wt));
+
+    check(`${name}: 첫 실행 리네임 완료`, branchOf(wt) === 'feature/sample-task', `branch=${branchOf(wt)}`);
+    check(`${name}: 완료 후 기억 제거`, !pendingHasPath(wt), JSON.stringify(pendingValue()));
+    check(
+      `${name}: terminal.sendText 없음`,
+      w.leftoverHostCalls().every((m) => m.method !== 'terminal.sendText'),
+      w.dump(),
+    );
+  } catch (err) {
+    fail(name, err.message);
+  } finally {
+    try {
+      w.child.kill();
+    } catch {
+      /* ignore */
+    }
+  }
+}
+
 async function main() {
   console.log(`== Orca 플러그인 호스트 테스트 ==`);
   console.log(`plugin root: ${ROOT}`);
@@ -650,6 +958,10 @@ async function main() {
   const eInfo = await caseE();
   await caseF(eInfo);
   await caseG();
+  const h1 = await caseH1();
+  await caseH2(h1);
+  await caseH3();
+  await caseH4();
 
   console.log('');
   console.log(`요약: PASS=${PASS} FAIL=${FAIL} SKIP=${SKIP}`);
