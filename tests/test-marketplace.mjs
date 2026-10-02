@@ -108,20 +108,60 @@ function isReservedIdentity(key) {
   );
 }
 
-// HTTPS 또는 SSH(scp 형식 `git@host:path`, `ssh://`) 만 허용한다.
-function isAllowedGitUrl(url) {
-  const trimmed = typeof url === 'string' ? url.trim() : '';
-  if (trimmed.length === 0) return false;
-  if (trimmed.startsWith('https://')) return true;
-  if (trimmed.startsWith('ssh://')) return true;
-  return /^[^\s@/:]+@[^\s:]+:.+$/.test(trimmed);
+// Orca 1.4.217 plugin-install-lockfile.js isAllowedPluginGitUrl 과 같은 규칙.
+// scp 형식(git@host:path) 또는 https(자격증명 없음)/ssh URL 만 허용하고, 문자열이 아니면 false.
+function isAllowedGitUrl(value) {
+  if (typeof value !== 'string') return false;
+  const url = value.trim();
+  if (/^[^\s@/:]+@[A-Za-z0-9.-]+:[^\s]+$/.test(url)) {
+    return true;
+  }
+  try {
+    const parsed = new URL(url);
+    if (!parsed.hostname || parsed.password) {
+      return false;
+    }
+    if (parsed.protocol === 'https:') {
+      return parsed.username.length === 0;
+    }
+    return parsed.protocol === 'ssh:';
+  } catch {
+    return false;
+  }
 }
 
-function stripGitSuffix(url) {
-  return String(url)
-    .trim()
+// Orca 1.4.217 plugin-install-lockfile.js parseGitRepositoryIdentity 와 같은 방식.
+// scp 형식 또는 https/ssh URL 에서 {host, owner, repository} 를 뽑고, 못 뽑으면 null.
+function repositoryIdentity(url) {
+  if (typeof url !== 'string') return null;
+  const trimmed = url.trim();
+  const scp = /^[^\s@/:]+@([^\s:]+):(.+)$/.exec(trimmed);
+  let host;
+  let pathname;
+  if (scp) {
+    host = scp[1];
+    pathname = scp[2];
+  } else {
+    let parsed;
+    try {
+      parsed = new URL(trimmed);
+    } catch {
+      return null;
+    }
+    if (parsed.protocol !== 'https:' && parsed.protocol !== 'ssh:') return null;
+    host = parsed.hostname;
+    pathname = parsed.pathname;
+  }
+  const segments = pathname
+    .replace(/^\/+/, '')
     .replace(/\/+$/, '')
-    .replace(/\.git$/i, '');
+    .split('/')
+    .filter((segment) => segment.length > 0);
+  if (segments.length < 2) return null;
+  const owner = segments[0];
+  const repository = segments[segments.length - 1].replace(/\.git$/i, '');
+  if (repository.length === 0) return null;
+  return { host: host.toLowerCase(), owner, repository };
 }
 
 function loadJson(path, label) {
@@ -365,13 +405,20 @@ function checkRepoEntry(mp, manifest) {
     `기대: ${expectedRef} (manifest.version + 'v'), 실제: ${JSON.stringify(entry.source && entry.source.ref)}`
   );
 
+  const sourceIdentity =
+    isPlainObject(entry.source) && typeof entry.source.url === 'string'
+      ? repositoryIdentity(entry.source.url)
+      : null;
+  const manifestIdentity =
+    typeof manifest.repository === 'string' ? repositoryIdentity(manifest.repository) : null;
   check(
     `${qualified} source.url 이 manifest.repository 와 같은 저장소`,
-    isPlainObject(entry.source) &&
-      typeof entry.source.url === 'string' &&
-      typeof manifest.repository === 'string' &&
-      stripGitSuffix(entry.source.url) === stripGitSuffix(manifest.repository),
-    `기대: ${stripGitSuffix(manifest.repository)} (끝 '.git' 무시), 실제: ${isPlainObject(entry.source) ? stripGitSuffix(entry.source.url) : '(source 없음)'}`
+    sourceIdentity !== null &&
+      manifestIdentity !== null &&
+      sourceIdentity.host === manifestIdentity.host &&
+      sourceIdentity.owner.toLowerCase() === manifestIdentity.owner.toLowerCase() &&
+      sourceIdentity.repository.toLowerCase() === manifestIdentity.repository.toLowerCase(),
+    `기대: ${JSON.stringify(manifestIdentity)}, 실제: ${JSON.stringify(sourceIdentity)}`
   );
 
   check(
