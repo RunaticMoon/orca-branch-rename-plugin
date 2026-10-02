@@ -39,7 +39,7 @@ grep -rl 'autoRenameBranchFromWork' "$tmp" | head
   - `context`: `commands.register`, `events.on`, `host.call(method, params)`, `grantedCapabilities`, `log`
 - 제한 시간: 준비 10초, 명령 30초, 이벤트 5분.
 - 설치·동의 화면 문구: "Its worker still runs as a normal process on your computer with full access to your files, network, and other processes." capability는 Orca API를 쓰는 범위만 제한한다. 그래서 워커가 `git`이나 셸을 실행하는 것은 Orca가 밝힌 신뢰 모델 안의 동작이다.
-- 워커가 받는 `worktree.created` payload는 `{worktreeId, path, branch}`다. 워크트리가 만들어지고 상태에 등록된 **뒤**에 비동기로 오는 사후 이벤트다. 생성 전에 이름을 가로챌 방법은 없다.
+- 워커가 받는 `worktree.created` payload는 `{worktreeId, path, branch}`다. 실제 앱(1.4.217)에서 `branch`는 `refs/heads/<이름>` 형태로 온다(격리 프로필 실기 확인). 그래서 플러그인은 `refs/heads/`를 떼고 비교한다. 워크트리가 만들어지고 상태에 등록된 **뒤**에 비동기로 오는 사후 이벤트다. 생성 전에 이름을 가로챌 방법은 없다.
 - host API(v0)
   | 메서드 | 필요한 capability | 입출력 |
   |---|---|---|

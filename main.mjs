@@ -36,6 +36,17 @@ const pending = new Map();
 const PENDING_KEY = 'pending';
 const PENDING_MAX = 200;
 
+// 실제 Orca 는 worktree 의 branch 를 짧은 이름이 아니라 `refs/heads/<이름>` 형태로 준다
+// (renderer worktrees.list 결과가 `branch:"refs/heads/main"`). 그런데 여기서 현재 브랜치는
+// `git symbolic-ref --short HEAD` 의 짧은 이름으로 읽어 비교하므로, 접두사를 떼지 않으면
+// 항상 불일치로 보여 정상 기억을 지워 버린다. 그래서 이벤트·컨텍스트로 받은 이름에서
+// `refs/heads/` 를 한 번 떼어 짧은 이름으로 맞춘다. 그 외(`refs/remotes/...` 등)는 그대로 둔다.
+function normalizeBranch(name) {
+  if (typeof name !== 'string') return '';
+  const PREFIX = 'refs/heads/';
+  return name.startsWith(PREFIX) ? name.slice(PREFIX.length) : name;
+}
+
 // 브랜치의 마지막 '/' 뒤 부분만 본다. 스크립트와 같은 기준을 쓴다.
 function branchTail(branch) {
   const i = branch.lastIndexOf('/');
@@ -252,8 +263,8 @@ async function processWorktree(context, worktreePath, branch) {
 
 async function onWorktreeCreated(context, payload) {
   const worktreePath = payload && payload.path;
-  const branch = payload && payload.branch;
-  if (typeof worktreePath !== 'string' || worktreePath.length === 0 || typeof branch !== 'string') {
+  const branch = normalizeBranch(payload && payload.branch);
+  if (typeof worktreePath !== 'string' || worktreePath.length === 0 || branch.length === 0) {
     context.log('worktree.created: path/branch 가 올바른 문자열이 아님');
     return;
   }
@@ -297,7 +308,7 @@ async function renameBranchEn(context) {
     return { ok: false };
   }
 
-  const branch = typeof ctx.branch === 'string' ? ctx.branch : '';
+  const branch = normalizeBranch(ctx.branch);
   if (!NON_ASCII.test(branchTail(branch))) {
     await notify(context, '브랜치 이름 바꾸기', '이미 영어 브랜치입니다');
     return { ok: false };
@@ -396,7 +407,8 @@ export default async function activate(context) {
     if (stored && typeof stored === 'object' && !Array.isArray(stored)) {
       for (const [worktreePath, branch] of Object.entries(stored)) {
         if (typeof worktreePath === 'string' && typeof branch === 'string') {
-          rememberPending(worktreePath, branch);
+          // 이전 실행이 `refs/heads/` 가 붙은 형태로 저장했을 수 있어 복원 때도 정규화한다.
+          rememberPending(worktreePath, normalizeBranch(branch));
         }
       }
     }
