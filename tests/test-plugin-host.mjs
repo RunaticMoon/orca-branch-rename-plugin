@@ -27,6 +27,18 @@ const ROOT = dirname(HERE);
 const MANIFEST_PATH = join(ROOT, 'orca-plugin.json');
 const SCRIPT_PATH = join(ROOT, 'bin', 'orca-branch-en.sh');
 
+// 플러그인이 storage.set/get 으로 쓰는 값. 워커(자식 프로세스)들끼리 공유해
+// 재시작 후에도 pending 이 남아 있는지 검증할 수 있게 한다.
+const SHARED_STORAGE = new Map();
+const PENDING_KEY = 'pending';
+function pendingValue() {
+  const v = SHARED_STORAGE.get(PENDING_KEY);
+  return v && typeof v === 'object' && !Array.isArray(v) ? v : {};
+}
+function pendingHas(branch) {
+  return Object.prototype.hasOwnProperty.call(pendingValue(), branch);
+}
+
 // 플랫폼별 기본 Orca 리소스 위치. 실제로 존재하는 쪽을 고른다.
 function defaultOrcaResources() {
   const linux = '/home/ubuntu/.local/opt/orca/1.4.217/squashfs-root/resources';
@@ -120,6 +132,7 @@ function startWorker(extraEnv) {
 
   const messages = [];
   const waiters = [];
+  const storageCalls = [];
   let stderr = '';
   let exited = null;
   const exitWaiters = [];
@@ -129,6 +142,19 @@ function startWorker(extraEnv) {
     stderr += d.toString();
   });
   child.on('message', (m) => {
+    // storage.get/set 은 하네스가 직접 응답하고, 기록만 남긴다.
+    if (m && m.type === 'hostCall' && (m.method === 'storage.get' || m.method === 'storage.set')) {
+      storageCalls.push(m);
+      const key = m.params && m.params.key;
+      if (m.method === 'storage.get') {
+        const value = SHARED_STORAGE.has(key) ? SHARED_STORAGE.get(key) : null;
+        child.send({ type: 'hostResult', callId: m.callId, ok: true, value: { value } });
+      } else {
+        SHARED_STORAGE.set(key, m.params ? m.params.value : undefined);
+        child.send({ type: 'hostResult', callId: m.callId, ok: true, value: { ok: true } });
+      }
+      return;
+    }
     const i = waiters.findIndex((w) => w.pred(m));
     if (i >= 0) {
       const [w] = waiters.splice(i, 1);
@@ -188,6 +214,7 @@ function startWorker(extraEnv) {
     waitExit,
     hostResult,
     send: (m) => child.send(m),
+    storageCalls: () => storageCalls,
     leftoverHostCalls: () => messages.filter((m) => m.type === 'hostCall'),
     dump,
     init() {
@@ -196,13 +223,23 @@ function startWorker(extraEnv) {
         pluginId: 'korean-branch-en',
         pluginRoot: ROOT,
         mainEntry: 'main.mjs',
-        grantedCapabilities: ['events:subscribe', 'notifications:show', 'workspace:read', 'terminal:send'],
+        grantedCapabilities: ['events:subscribe', 'notifications:show', 'workspace:read', 'storage'],
       });
     },
   };
 }
 
 const delay = (ms) => new Promise((r) => setTimeout(r, ms));
+
+// 조건이 참이 될 때까지 짧게 폴링한다(비동기 후처리 확인용).
+async function waitFor(cond, timeout = 5000, step = 50) {
+  const end = Date.now() + timeout;
+  while (true) {
+    if (cond()) return true;
+    if (Date.now() >= end) return cond();
+    await delay(step);
+  }
+}
 
 // ---------------------------------------------------------------------------
 // 케이스 a: 매니페스트 검증기
@@ -297,6 +334,14 @@ async function caseC() {
     const titleOk = call.params && call.params.title === '브랜치 이름을 바꿨습니다';
     const bodyOk = call.params && call.params.body === 'feature/샘플-작업 → feature/sample-task';
     check(`${name}: 알림 내용`, titleOk && bodyOk, JSON.stringify(call.params));
+
+    // 실행 전에 pending 이 기록됐다가, renamed 후 제거됐는지 본다.
+    const recorded = w
+      .storageCalls()
+      .filter((m) => m.method === 'storage.set')
+      .some((m) => m.params && m.params.value && Object.prototype.hasOwnProperty.call(m.params.value, 'feature/샘플-작업'));
+    check(`${name}: 실행 전 pending 기록`, recorded, JSON.stringify(w.storageCalls()));
+    check(`${name}: renamed 후 pending 제거`, !pendingHas('feature/샘플-작업'), JSON.stringify(pendingValue()));
   } catch (err) {
     fail(name, err.message);
   } finally {
@@ -363,7 +408,7 @@ async function caseE() {
   const name = 'e slug 실패 → 실패 알림';
   if (!existsSync(HOST_ENTRY)) {
     skip(name, 'host entry 없음');
-    return;
+    return null;
   }
   let w;
   try {
@@ -397,8 +442,12 @@ async function caseE() {
       call.params && call.params.title === '브랜치 이름 바꾸기 실패',
       JSON.stringify(call.params),
     );
+    // 실패했으니 pending 에 경로가 남아 있어야 이후 수동 재시도가 가능하다.
+    check(`${name}: 실패 후 pending 유지`, pendingHas('feature/한글-실패'), JSON.stringify(pendingValue()));
+    return { wt, branch: 'feature/한글-실패' };
   } catch (err) {
     fail(name, err.message);
+    return null;
   } finally {
     try {
       w.child.kill();
@@ -409,71 +458,138 @@ async function caseE() {
 }
 
 // ---------------------------------------------------------------------------
-// 케이스 f: 수동 커맨드
+// 케이스 f: 수동 커맨드 (경로 기억 방식)
 // ---------------------------------------------------------------------------
-async function caseF() {
+async function caseF(eInfo) {
   const name = 'f 수동 rename-branch-en 커맨드';
   if (!existsSync(HOST_ENTRY)) {
     skip(name, 'host entry 없음');
     return;
   }
+  if (!eInfo) {
+    skip(name, '케이스 e 정보 없음');
+    return;
+  }
   let w;
   try {
-    w = startWorker({ ORCA_BRANCH_EN_LOG: join(TMP, 'f.log') });
+    // e 에서 남은 pending(storage 가 워커 간에 공유됨)을 그대로 물려받은 워커를 새로 띄운다.
+    w = startWorker({
+      ORCA_BRANCH_EN_SLUG_CMD: 'echo "sample task"',
+      ORCA_BRANCH_EN_LOG: join(TMP, 'f.log'),
+    });
     w.init();
     await w.next((m) => m.type === 'ready', 'ready');
 
-    // f1: 터미널 있음 → terminal.sendText
+    // f1: pending 에 기억된 경로를 재시도 → 즉시 started 반환 후 실제 리네임+알림.
     w.send({ type: 'invokeCommand', callId: 101, commandId: 'rename-branch-en' });
     const rc1 = await w.next(
       (m) => m.type === 'hostCall' && m.method === 'workspace.readContext',
-      'workspace.readContext',
+      'workspace.readContext(f1)',
     );
-    w.hostResult(rc1.callId, { branch: 'feature/한글-수동', displayName: 'x', terminals: [{ id: 't1' }] });
-    const send = await w.next(
-      (m) => m.type === 'hostCall' && m.method === 'terminal.sendText',
-      'terminal.sendText',
-    );
-    const expectedText = `/bin/bash '${SCRIPT_PATH}'`;
-    check(
-      `${name}: sendText text/enter/terminalId`,
-      send.params &&
-        send.params.text === expectedText &&
-        send.params.enter === true &&
-        send.params.terminalId === 't1',
-      JSON.stringify(send.params),
-    );
-    w.hostResult(send.callId, { accepted: true });
+    w.hostResult(rc1.callId, { branch: eInfo.branch, displayName: 'x', terminals: [] });
     const cmd1 = await w.next(
       (m) => m.type === 'commandResult' && m.callId === 101,
       'commandResult 101',
     );
     check(
-      `${name}: commandResult ok + value.ok`,
-      cmd1.ok === true && cmd1.value && cmd1.value.ok === true,
+      `${name}: f1 즉시 started 반환`,
+      cmd1.ok === true && cmd1.value && cmd1.value.ok === true && cmd1.value.started === true,
       JSON.stringify(cmd1),
     );
+    const notif1 = await w.next(
+      (m) => m.type === 'hostCall' && m.method === 'notifications.show',
+      'notifications.show(f1)',
+    );
+    w.hostResult(notif1.callId, { delivered: true });
+    await waitFor(() => branchOf(eInfo.wt) === 'feature/sample-task' && !pendingHas(eInfo.branch));
+    check(
+      `${name}: f1 브랜치 영어로 변경`,
+      branchOf(eInfo.wt) === 'feature/sample-task',
+      `branch=${branchOf(eInfo.wt)}`,
+    );
+    check(
+      `${name}: f1 성공 알림`,
+      notif1.params && notif1.params.title === '브랜치 이름을 바꿨습니다',
+      JSON.stringify(notif1.params),
+    );
+    check(`${name}: f1 pending 제거`, !pendingHas(eInfo.branch), JSON.stringify(pendingValue()));
 
-    // f2: readContext null → 알림 후 value.ok=false
+    // f2: readContext null → value.ok=false
     w.send({ type: 'invokeCommand', callId: 102, commandId: 'rename-branch-en' });
     const rc2 = await w.next(
       (m) => m.type === 'hostCall' && m.method === 'workspace.readContext',
-      'workspace.readContext(null)',
+      'workspace.readContext(f2)',
     );
     w.hostResult(rc2.callId, null);
-    const notif = await w.next(
+    const notif2 = await w.next(
       (m) => m.type === 'hostCall' && m.method === 'notifications.show',
-      'notifications.show(터미널없음)',
+      'notifications.show(f2)',
     );
-    w.hostResult(notif.callId, { delivered: true });
+    w.hostResult(notif2.callId, { delivered: true });
     const cmd2 = await w.next(
       (m) => m.type === 'commandResult' && m.callId === 102,
       'commandResult 102',
     );
     check(
-      `${name}: 터미널 없음 → ok + value.ok=false`,
+      `${name}: f2 컨텍스트 없음 → value.ok=false`,
       cmd2.ok === true && cmd2.value && cmd2.value.ok === false,
       JSON.stringify(cmd2),
+    );
+
+    // f3: ASCII 브랜치 → value.ok=false
+    w.send({ type: 'invokeCommand', callId: 103, commandId: 'rename-branch-en' });
+    const rc3 = await w.next(
+      (m) => m.type === 'hostCall' && m.method === 'workspace.readContext',
+      'workspace.readContext(f3)',
+    );
+    w.hostResult(rc3.callId, { branch: 'feature/already-english', displayName: 'x', terminals: [] });
+    const notif3 = await w.next(
+      (m) => m.type === 'hostCall' && m.method === 'notifications.show',
+      'notifications.show(f3)',
+    );
+    w.hostResult(notif3.callId, { delivered: true });
+    const cmd3 = await w.next(
+      (m) => m.type === 'commandResult' && m.callId === 103,
+      'commandResult 103',
+    );
+    check(
+      `${name}: f3 ASCII → value.ok=false`,
+      cmd3.ok === true && cmd3.value && cmd3.value.ok === false,
+      JSON.stringify(cmd3),
+    );
+
+    // f4: pending 에 없는 한글 브랜치 → 경로 안내 알림
+    w.send({ type: 'invokeCommand', callId: 104, commandId: 'rename-branch-en' });
+    const rc4 = await w.next(
+      (m) => m.type === 'hostCall' && m.method === 'workspace.readContext',
+      'workspace.readContext(f4)',
+    );
+    w.hostResult(rc4.callId, { branch: 'feature/모르는-브랜치', displayName: 'x', terminals: [] });
+    const notif4 = await w.next(
+      (m) => m.type === 'hostCall' && m.method === 'notifications.show',
+      'notifications.show(f4)',
+    );
+    w.hostResult(notif4.callId, { delivered: true });
+    const cmd4 = await w.next(
+      (m) => m.type === 'commandResult' && m.callId === 104,
+      'commandResult 104',
+    );
+    check(
+      `${name}: f4 경로 모름 → value.ok=false`,
+      cmd4.ok === true && cmd4.value && cmd4.value.ok === false,
+      JSON.stringify(cmd4),
+    );
+    check(
+      `${name}: f4 경로 안내 알림`,
+      notif4.params && typeof notif4.params.body === 'string' && notif4.params.body.includes('orca-branch-en.sh'),
+      JSON.stringify(notif4.params),
+    );
+
+    // 어떤 경로로도 터미널에 타이핑하지 않아야 한다.
+    check(
+      `${name}: terminal.sendText 없음`,
+      w.leftoverHostCalls().every((m) => m.method !== 'terminal.sendText'),
+      w.dump(),
     );
   } catch (err) {
     fail(name, err.message);
@@ -531,8 +647,8 @@ async function main() {
   }
   await caseC();
   await caseD();
-  await caseE();
-  await caseF();
+  const eInfo = await caseE();
+  await caseF(eInfo);
   await caseG();
 
   console.log('');

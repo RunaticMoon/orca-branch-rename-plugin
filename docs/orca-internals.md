@@ -46,7 +46,7 @@ grep -rl 'autoRenameBranchFromWork' "$tmp" | head
   | `workspace.readContext` | `workspace:read` | `{branch, displayName, terminals:[{id}]} \| null` (경로는 주지 않음) |
   | `terminal.sendText` | `terminal:send` | `{terminalId, text, enter?}` → `{accepted}`. 현재 워크트리의 터미널만 가능 |
   | `notifications.show` | `notifications:show` | `{title(≤120), body?(≤1000)}` → `{delivered}` |
-  | `storage.*` | `storage` | 키-값 저장 |
+  | `storage.get` / `storage.set` | `storage` | `{key}` → `{value}` / `{key, value}` → `{ok}` |
   | `secrets.*` | `secrets` | 시크릿 저장 |
   | `settings.*` | `settings:own` | 플러그인 자체 설정 |
 
@@ -62,6 +62,12 @@ grep -rl 'autoRenameBranchFromWork' "$tmp" | head
 - 설치 위치: `<userData>/plugins/<publisher>.<id>/<contentHash>/`
   - `<userData>`는 macOS에서 `~/Library/Application Support/orca`, Linux에서 `~/.config/orca`다.
 - 실행 로그는 Settings의 플러그인 행 → **View logs**에서 본다(최근 200줄).
+
+### 이 플러그인의 선택
+
+- `workspace.readContext`가 경로를 주지 않으므로 수동 명령은 `worktree.created`에서 받은 `branch → path`를 storage 키 `pending`에 기억해 두고 쓴다(최대 200개, 성공하면 지운다).
+- `terminal.sendText`는 쓰지 않는다. 첫 터미널에서 에이전트 TUI가 돌고 있으면 입력이 프롬프트로 들어가기 때문이다.
+- 명령 제한이 30초라 수동 명령은 스크립트를 시작만 하고 바로 반환한다. 결과는 알림으로 알린다.
 
 ## 셋업 스크립트
 

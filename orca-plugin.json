@@ -21,7 +21,7 @@
     "commands": [
       {
         "id": "rename-branch-en",
-        "title": "브랜치 이름을 영어로 바꾸기",
+        "title": "브랜치 이름을 영어로 다시 바꾸기",
         "context": "worktree"
       }
     ]
@@ -30,6 +30,6 @@
     { "kind": "events:subscribe" },
     { "kind": "notifications:show" },
     { "kind": "workspace:read" },
-    { "kind": "terminal:send" }
+    { "kind": "storage" }
   ]
 }
